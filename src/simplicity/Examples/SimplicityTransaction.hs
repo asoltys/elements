@@ -1,6 +1,7 @@
 module Main where
 
-import Control.Monad (guard)
+import Debug.Trace (trace)
+import Control.Monad (guard, void)
 import qualified Data.Array as Arr
 import Data.Bits (Bits, unsafeShiftL, unsafeShiftR, (.&.), (.|.), xor, testBit)
 import qualified Data.ByteString as BS
@@ -105,6 +106,24 @@ bech32Polymod values = foldl' go 1 {- :TODO: This constant needs to be updated f
 bech32HRPExpand :: HRP -> [Word5]
 bech32HRPExpand hrp = map (UnsafeWord5 . (.>>. 5)) (BS.unpack hrp) ++ [UnsafeWord5 0] ++ map word5 (BS.unpack hrp)
 
+bech32mCreateChecksum :: HRP -> [Word5] -> [Word5]
+bech32mCreateChecksum hrp dat = [word5 (polymod .>>. i) | i <- [25,20..0]]
+  where
+    values = bech32HRPExpand hrp ++ dat
+    polymod = bech32Polymod (values ++ map UnsafeWord5 [0, 0, 0, 0, 0, 0]) `xor` 0x2bc830a3
+
+bech32mVerifyChecksum :: HRP -> [Word5] -> Bool
+bech32mVerifyChecksum hrp dat = bech32Polymod (bech32HRPExpand hrp ++ dat) == 0x2bc830a3
+
+bech32mEncode :: HRP -> [Word5] -> Maybe BS.ByteString
+bech32mEncode hrp dat = do
+    guard $ checkHRP hrp
+    let dat' = dat ++ bech32mCreateChecksum hrp dat
+        rest = map (charset Arr.!) dat'
+        result = BSC.concat [BSC.map toLower hrp, BSC.pack "1", BSC.pack rest]
+    guard $ BS.length result <= 90
+    return result
+
 bech32CreateChecksum :: HRP -> [Word5] -> [Word5]
 bech32CreateChecksum hrp dat = [word5 (polymod .>>. i) | i <- [25,20..0]]
   where
@@ -125,6 +144,18 @@ bech32Encode hrp dat = do
 
 checkHRP :: BS.ByteString -> Bool
 checkHRP hrp = not (BS.null hrp) && BS.all (\char -> char >= 33 && char <= 126) hrp
+
+bech32mDecode :: BS.ByteString -> Maybe (HRP, [Word5])
+bech32mDecode bech32m = do
+    guard $ BS.length bech32m <= 90
+    guard $ BSC.map toUpper bech32m == bech32m || BSC.map toLower bech32m == bech32m
+    let (hrp, dat) = BSC.breakEnd (== '1') $ BSC.map toLower bech32m
+    guard $ BS.length dat >= 6
+    hrp' <- BSC.stripSuffix (BSC.pack "1") hrp
+    guard $ checkHRP hrp'
+    dat' <- mapM charsetMap $ BSC.unpack dat
+    guard $ bech32mVerifyChecksum hrp' dat'
+    return (hrp', take (BS.length dat - 6) dat')
 
 bech32Decode :: BS.ByteString -> Maybe (HRP, [Word5])
 bech32Decode bech32 = do
@@ -194,6 +225,20 @@ segwitEncode :: HRP -> Word8 -> Data -> Maybe BS.ByteString
 segwitEncode hrp witver witprog = do
     guard $ segwitCheck witver witprog
     bech32Encode hrp $ UnsafeWord5 witver : toBase32 witprog
+
+taprootDecode :: HRP -> BS.ByteString -> Maybe (Word8, Data)
+taprootDecode hrp addr = do
+    (hrp', dat) <- bech32mDecode addr
+    guard $ (hrp == hrp') && not (null dat)
+    let (UnsafeWord5 witver : datBase32) = dat
+    decoded <- toBase256 datBase32
+    guard $ segwitCheck witver decoded
+    return (witver, decoded)
+
+taprootEncode :: HRP -> Word8 -> Data -> Maybe BS.ByteString
+taprootEncode hrp witver witprog = do
+    guard $ segwitCheck witver witprog
+    bech32mEncode hrp $ UnsafeWord5 witver : toBase32 witprog
 
 -- Construct an Elements regtest non-blinded address for a segwit program
 ertScriptPubKey :: Word8 -> Data -> BSL.ByteString
@@ -314,7 +359,7 @@ main = do
   let Just trP = standardTR p
       
   -- compute the address for our standard program for our choosen key.
-  let Just simplicityAddress = segwitEncode (fromString "ert") 0x01 (BS.unpack . encode $ outputKey trP)
+  let Just simplicityAddress = taprootEncode (fromString "tex") 0x01 (BS.unpack . encode $ outputKey trP)
 
   putStr "Example simplicity address: " >> BSC.putStrLn simplicityAddress
 
@@ -328,21 +373,33 @@ main = do
   -- In this example we will be using Simplicity's version similar to hashAll.
   -- Optimize the hashAll program with jets.
   let optHashAll = jetSubst hashAll
+
+  let inputTxid = 0xb22827bac1582f8db498d2d0cddb6b63e322dfde6373cdec8ea68ee98a0279a4
+  let inputVout = 1                                                                                                                 
+  let assetId = Asset . Explicit . review (over le256) $ 0x8cd3f1bb67f21a94aa7cc0efd65a3eb08d74df8108bb4cc425656669f0787964
+  let inputAmount = 100000                                                                                                        
+  let inputUtxo = UTXO {                                                                                                            
+    utxoAsset = assetId,                                                                                                            
+    utxoAmount = Amount . Explicit $ inputAmount,                                                                                   
+    utxoScript = ertScriptPubKey 1 (BS.unpack . encode $ outputKey trP)
+  }                                                           
       
-  -- To spend funds we need the UTXO data, including the txid, vout, asset id and amount.
-  inputTxid <- getHexLine "Input's TXID" 64 Nothing
-  inputVout <- getIntLine "Input's vout"
-  assetId <- Asset . Explicit . review (over le256) <$> getHexLine "Input's asset ID" 64 (Just 0xb248df0c57c299290f3a46ff74e4a8ca9f365632bfd6fa43f915e6756bc756ee)
-  inputAmount <- getIntLine "Input's value in sats"
-  let inputUtxo = UTXO { utxoAsset = assetId
-                       , utxoAmount = Amount . Explicit $ inputAmount
-                       , utxoScript = ertScriptPubKey 1 (BS.unpack . encode $ outputKey trP)
-                       }
+  -- -- To spend funds we need the UTXO data, including the txid, vout, asset id and amount.
+  -- inputTxid <- getHexLine "Input's TXID" 64 Nothing
+  -- inputVout <- getIntLine "Input's vout"
+  -- assetId <- Asset . Explicit . review (over le256) <$> getHexLine "Input's asset ID" 64 (Just 0xb248df0c57c299290f3a46ff74e4a8ca9f365632bfd6fa43f915e6756bc756ee)
+  -- inputAmount <- getIntLine "Input's value in sats"
+  -- let inputUtxo = UTXO { utxoAsset = assetId
+  --                      , utxoAmount = Amount . Explicit $ inputAmount
+  --                      , utxoScript = ertScriptPubKey 1 (BS.unpack . encode $ outputKey trP)
+  --                      }
   
+
   -- We need an address where to spend funds too and how much in fees to subtract.
-  outputAddress <- getStrLine "Output's address" "ert1qaenpwkrxcg279rylqsn54jpjw6vrs5efm9ttql"
-  let Just outputScript = uncurry ertScriptPubKey <$> segwitDecode (fromString "ert") (fromString outputAddress)
-  fee <- getIntLine "fee in sats"
+
+  let outputAddress = "tex1qehdhmsmshyck2xurx9rfah4sckjkhxh9h8lyf7"                                                                 
+  let Just outputScript = uncurry ertScriptPubKey <$> segwitDecode (fromString "tex") (fromString outputAddress)                                 
+  let fee = 10000
   let outputAmount = inputAmount-fee
   guard (0 < outputAmount)
   -- Construct the output script from the given address.
@@ -350,27 +407,10 @@ main = do
   -- Construct the transaction data, including inputs and outputs, including the explicit fee required by Elements.
   -- We assume a standard sequence number.
   let inputSequence = 0xfffffffe
-  let input0 = SigTxInput { sigTxiIsPegin = False
-                          , sigTxiPreviousOutpoint = Outpoint (review (over le256) inputTxid) inputVout
-                          , sigTxiTxo = inputUtxo
-                          , sigTxiSequence = inputSequence
-                          , sigTxiIssuance = Nothing
-                          }
-  let output0 = TxOutput { txoAsset = assetId
-                         , txoAmount = Amount . Explicit $ outputAmount
-                         , txoNonce = Nothing
-                         , txoScript = outputScript
-                         }
-  let output1 = TxOutput { txoAsset = assetId
-                         , txoAmount = Amount . Explicit $ fee
-                         , txoNonce = Nothing
-                         , txoScript = mempty
-                         }
-  let tx = SigTx { sigTxVersion = 0x00000002
-                 , sigTxIn = listArray (0, 0) [input0]
-                 , sigTxOut = listArray (0, 1) [output0, output1]
-                 , sigTxLock = 0
-                 }
+  let input0 = SigTxInput { sigTxiIsPegin = False, sigTxiPreviousOutpoint = Outpoint (review (over le256) inputTxid) inputVout, sigTxiTxo = inputUtxo, sigTxiSequence = inputSequence, sigTxiIssuance = Nothing }
+  let output0 = TxOutput { txoAsset = assetId, txoAmount = Amount . Explicit $ outputAmount, txoNonce = Nothing, txoScript = outputScript }
+  let output1 = TxOutput { txoAsset = assetId, txoAmount = Amount . Explicit $ fee, txoNonce = Nothing, txoScript = mempty }
+  let tx = SigTx { sigTxVersion = 0x00000002, sigTxIn = listArray (0, 0) [input0], sigTxOut = listArray (0, 1) [output0, output1], sigTxLock = 0 }
                  
   -- The signing environment includes the transaction and which input we are signing for and the script we are signing for.
   -- Support for the taproot annex and control block is pending.
@@ -380,10 +420,7 @@ main = do
   let Just txHashAll = fromInteger . Simplicity.Ty.Word.fromWord256 <$> fastEval (unwrap optHashAll) env () :: Maybe Word256
       
   -- Our message is a tagged hash that covers both the CMR of our choosen sighash algorithm, and the output of that algorithm.
-  let msg = let tag = bsHash (fromString "Simplicity-Draft\USSignature") {- Currently Simplicity is in the Draft state. -}
-             in bsHash $ encode tag <> encode tag
-                      <> encode (commitmentRoot . unwrap $ optHashAll)
-                      <> encode (txHashAll :: Word256)
+  let msg = let tag = bsHash (fromString "Simplicity-Draft\USSignature") {- Currently Simplicity is in the Draft state. -} in bsHash $ encode tag <> encode tag <> encode (commitmentRoot . unwrap $ optHashAll) <> encode (txHashAll :: Word256)
 
   -- Create a BIP-0340 signature for our insecure pubkey using an insecure signing algorithm.
   -- This is for demonstration purposes only.  DO NOT USE!
